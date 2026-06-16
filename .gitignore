@@ -1,0 +1,11 @@
+node_modules
+.claude
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+.env
+/datagen/.venv
+.cc-history
+.wingman
+.claudeignore

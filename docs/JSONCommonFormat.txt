@@ -1,0 +1,138 @@
+Here's a changelog for your dashboard/backend team:
+
+WebSocket API Changelog — Schema-Driven Protocol v2
+Breaking Changes
+The MCU nodes now use a new WebSocket message format. Both registration and data messages have changed structure. The backend must be updated to handle the new format.
+
+1. Registration Message
+Before:
+
+
+{
+  "type": "register",
+  "client_name": "Front_Node",
+  "topics": ["sensors/stroke_Heave_distanceMM", "electrical/current_sense", ...],
+  "topic_metadata": {
+    "sensors/stroke_Heave_distanceMM": { "description": "Stroke Heave", "unit": "mm", "sampling_rate": 50 }
+  }
+}
+After:
+
+
+{
+  "type": "register",
+  "client_name": "Front_Node",
+  "groups": [
+    { "group": "front.mech",   "rate_hz": 50 },
+    { "group": "front.elect",  "rate_hz": 20 },
+    { "group": "front.faults", "rate_hz": 5 }
+  ],
+  "schema": [
+    { "key": "front.mech.STR_Heave_mm", "type": "float", "unit": "mm", "scale": 1, "offset": 0, "group": "front.mech" },
+    { "key": "front.mech.STR_Roll_mm",  "type": "float", "unit": "mm", "scale": 1, "offset": 0, "group": "front.mech" },
+    ...
+  ]
+}
+What changed:
+
+topics[] and topic_metadata{} are removed
+groups[] defines rate-groups. Each group has a name and its publish rate in Hz
+schema[] defines every data key with: key, type, unit, scale, offset, group
+For array fields (BMU cell voltages, temperatures), schema entries include a length field
+How to consume:
+
+Cache the schema on registration. Use it to build dynamic UI widgets
+type tells you the data type: float, double, bool, uint8, uint16, uint8[], uint16[]
+scale and offset are used to convert raw values to real units: real_value = raw * scale + offset
+For float/double/bool types, scale is always 1 and offset is always 0 (values are already in real units)
+For integer types (BMU data only), apply the conversion: e.g. V_CELL=186 with scale=0.02 → 186 * 0.02 = 3.72V
+2. Data Message
+Before:
+
+
+{
+  "type": "data",
+  "topic": "sensors/stroke_Heave_distanceMM",
+  "data": { "value": 12.34, "sensor_id": "STR_Heave" },
+  "timestamp": 1706000000000
+}
+After:
+
+{
+  "type": "data",
+  "group": "front.mech",
+  "ts": 1706000000000,
+  "d": {
+    "STR_Heave_mm": 12.34,
+    "STR_Roll_mm": 5.67
+  }
+}
+What changed:
+
+topic → group (matches a group name from registration)
+timestamp → ts (shortened)
+data → d (shortened, flat key-value pairs, no more value/sensor_id nesting)
+All values belonging to the same rate-group are batched into one message
+sensor_id field is removed — keys are self-identifying via the schema
+How to consume:
+
+Match msg.group to a registered group
+Iterate over msg.d keys, look up each key in the cached schema for type/unit/scale
+All keys in one message share the same timestamp (msg.ts)
+3. Per-Node Group Reference
+Front Node (client_name: "Front_Node")
+Group	Keys	Rate
+front.mech	STR_Heave_mm, STR_Roll_mm	MECH_SENSORS_SAMPLING_RATE
+front.elect	I_SENSE, TMP, APPS, BPPS	ELECT_SENSORS_SAMPLING_RATE
+front.faults	AMS_OK, IMD_OK, HV_ON, BSPD_OK	ELECT_FAULT_STAT_SAMPLING_RATE
+Rear Node (client_name: "Rear_Node")
+Group	Keys	Rate
+rear.mech	Wheel_RPM_L, Wheel_RPM_R, STR_Heave_mm, STR_Roll_mm	MECH_SENSORS_SAMPLING_RATE
+rear.odom	gps_lat, gps_lng, gps_age, gps_course, gps_speed, imu_accel_x, imu_accel_y, imu_accel_z, imu_gyro_x, imu_gyro_y, imu_gyro_z	ODOM_SENSORS_SAMPLING_RATE
+BAMO Node (client_name: "BAMO_Node")
+Group	Keys	Rate
+bamo.power	canVoltage, canCurrent, power, canVoltageValid, canCurrentValid	BAMO_POWER_SAMPLING_RATE
+bamo.temp	motorTemp, controllerTemp, motorTempValid, ctrlTempValid	BAMO_TEMP_SAMPLING_RATE
+Note: BAMO now always sends both groups every cycle. Validity booleans (canVoltageValid, motorTempValid, etc.) are included as data fields. The dashboard should check these flags before displaying the corresponding values. Previously, messages were conditionally skipped when data was invalid.
+
+AMS Node (client_name: "AMS_Node")
+Group pattern	Keys	Rate
+bmu{0-7}.cells	V_MODULE, V_CELL (array[10]), TEMP_SENSE (array[2]), DV, connected	BMU_CELLS_SAMPLING_RATE
+bmu{0-7}.faults	OV_WARN, OV_CRIT, LV_WARN, LV_CRIT, OT_WARN, OT_CRIT, ODV_WARN, ODV_CRIT, BAL_CELLS, NEED_BAL	BMU_FAULT_SAMPLING_RATE
+Note: AMS sends raw integer values. The dashboard must apply scale and offset from the schema to get real units:
+
+V_MODULE and V_CELL[]: multiply by 0.02 to get Volts
+TEMP_SENSE[]: multiply by 0.5 then subtract 40 to get Celsius
+DV: multiply by 0.1 to get Volts
+Fault flags (uint16): raw bitmask, scale=1
+AMS data example:
+
+
+{
+  "type": "data",
+  "group": "bmu0.cells",
+  "ts": 1706000000000,
+  "d": {
+    "V_MODULE": 3724,
+    "V_CELL": [186, 187, 185, 188, 186, 187, 185, 186, 188, 187],
+    "TEMP_SENSE": [165, 162],
+    "DV": 3,
+    "connected": true
+  }
+}
+Decoded: V_MODULE = 3724 * 0.02 = 74.48V, V_CELL[0] = 186 * 0.02 = 3.72V, TEMP_SENSE[0] = 165 * 0.5 - 40 = 42.5°C
+
+4. Message Volume Reduction
+Node	Before	After
+Front	10 msgs/cycle	3 msgs/cycle
+Rear	7 msgs/cycle	2 msgs/cycle
+BAMO	up to 5 msgs/cycle	2 msgs/cycle
+AMS	16 msgs/cycle	16 msgs/cycle (unchanged)
+5. Migration Checklist
+ Update registration parser: read groups[] and schema[] instead of topics[] and topic_metadata{}
+ Update data message parser: use group instead of topic, ts instead of timestamp, d instead of data
+ Remove per-topic routing logic — replace with generic schema-driven rendering
+ Add scaling logic for integer types: display_value = raw * schema.scale + schema.offset
+ Handle array fields in d (e.g. V_CELL, TEMP_SENSE) — check schema for length property
+ Handle validity flags for BAMO — check canVoltageValid/motorTempValid before displaying values
+ All timestamps (ts) are now consistently syncTime_calcRelative_ms across all nodes (AMS previously used a different source)
